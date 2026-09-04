@@ -60,6 +60,7 @@ Features
 - VAD (Voice Activity Detection) filter checkbox with a custom hover tooltip.
 - Interface available in English and Italian (Italian by default).
 - Two-column, scrollable layout with a self-contained dark theme.
+- Stop button to cancel an in-progress download or transcription.
 
 Run
 ---
@@ -419,6 +420,9 @@ TR = {
         "formats_label": "Output formats:",
         "group_run": "Run",
         "start_btn": "Start Transcription",
+        "stop_btn": "Stop",
+        "stopping": "Stopping...",
+        "cancelled_log": "Cancelled by user.",
         "no_gpu_title": "No GPU detected",
         "no_gpu_msg": "CUDA GPU was not detected on this machine. Falling back to CPU.",
         "missing_output_title": "Missing output folder",
@@ -510,6 +514,9 @@ TR = {
         "formats_label": "Formati di output:",
         "group_run": "Esecuzione",
         "start_btn": "Avvia trascrizione",
+        "stop_btn": "Interrompi",
+        "stopping": "Interruzione in corso...",
+        "cancelled_log": "Interrotto dall'utente.",
         "no_gpu_title": "Nessuna GPU rilevata",
         "no_gpu_msg": "Nessuna GPU CUDA rilevata su questa macchina. Verrà usata la CPU.",
         "missing_output_title": "Cartella di output mancante",
@@ -666,6 +673,13 @@ def apply_theme(root: tk.Tk, palette: dict) -> ttk.Style:
                           ("disabled", palette["panel_border"])],
               foreground=[("disabled", palette["text_faint"])])
 
+    style.configure("Danger.TButton", background=palette["danger"], foreground="#ffffff",
+                     padding=(16, 9), font=FONT_BOLD, borderwidth=0)
+    style.map("Danger.TButton",
+              background=[("active", "#ef8480"), ("pressed", "#c94f4b"),
+                          ("disabled", palette["panel_border"])],
+              foreground=[("disabled", palette["text_faint"])])
+
     style.configure("TEntry", fieldbackground=palette["entry_bg"], foreground=palette["entry_fg"],
                      bordercolor=palette["panel_border"], insertcolor=palette["text"],
                      lightcolor=palette["entry_bg"], darkcolor=palette["entry_bg"])
@@ -778,17 +792,31 @@ class InfoDot(tk.Canvas):
 # Background worker threads (communicate back to the Tk main loop via a
 # thread-safe queue, polled with root.after -- Tk widgets must only be
 # touched from the main thread).
+#
+# Both workers accept a threading.Event `cancel_event`. They check it at
+# every safe checkpoint (yt-dlp's progress hook; each transcribed segment)
+# and unwind cooperatively -- there is no way to hard-kill a Python thread,
+# so cancellation is always "please stop soon", not "stop now".
 # ------------------------------------------------------------------------
 
+class CancelledError(Exception):
+    """Raised internally to unwind a worker once cancellation is requested."""
+
+
 class DownloadWorker(threading.Thread):
-    def __init__(self, url: str, out_dir: str, result_queue: "queue.Queue"):
+    def __init__(self, url: str, out_dir: str, result_queue: "queue.Queue", cancel_event: "threading.Event"):
         super().__init__(daemon=True)
         self.url = url
         self.out_dir = out_dir
         self.result_queue = result_queue
+        self.cancel_event = cancel_event
         self._final_path = None
 
     def _hook(self, d):
+        # yt-dlp calls this hook frequently during download; it's our only
+        # cooperative checkpoint, so raise to unwind ydl.download() cleanly.
+        if self.cancel_event.is_set():
+            raise CancelledError("cancelled during download")
         if d.get("status") == "downloading":
             pct = d.get("_percent_str", "").strip()
             speed = d.get("_speed_str", "").strip()
@@ -820,9 +848,14 @@ class DownloadWorker(threading.Thread):
             "progress_hooks": [self._hook],
         }
         try:
+            if self.cancel_event.is_set():
+                raise CancelledError("cancelled before download started")
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 self.result_queue.put(("log", f"Fetching info for: {self.url}"))
                 ydl.download([self.url])
+
+            if self.cancel_event.is_set():
+                raise CancelledError("cancelled after download")
 
             if not self._final_path:
                 self.result_queue.put(("failed", "Download completed but no output file was captured."))
@@ -835,14 +868,23 @@ class DownloadWorker(threading.Thread):
                 self.result_queue.put(("download_done", self._final_path))
             else:
                 self.result_queue.put(("failed", "Could not locate the downloaded/extracted audio file."))
+        except CancelledError:
+            self.result_queue.put(("cancelled", None))
         except Exception as e:
-            self.result_queue.put(("failed", f"Download failed: {e}\n{traceback.format_exc()}"))
+            # yt-dlp wraps hook exceptions in its own DownloadError; if our
+            # CancelledError is the root cause, still report it as a clean
+            # cancellation rather than a failure.
+            if self.cancel_event.is_set():
+                self.result_queue.put(("cancelled", None))
+            else:
+                self.result_queue.put(("failed", f"Download failed: {e}\n{traceback.format_exc()}"))
 
 
 class TranscribeWorker(threading.Thread):
     def __init__(self, audio_path, model_name, device, compute_type,
                  language, initial_prompt, prefix, hotwords,
-                 vad_filter, beam_size, cpu_threads, result_queue: "queue.Queue"):
+                 vad_filter, beam_size, cpu_threads, result_queue: "queue.Queue",
+                 cancel_event: "threading.Event"):
         super().__init__(daemon=True)
         self.audio_path = audio_path
         self.model_name = model_name
@@ -856,6 +898,7 @@ class TranscribeWorker(threading.Thread):
         self.beam_size = beam_size
         self.cpu_threads = cpu_threads
         self.result_queue = result_queue
+        self.cancel_event = cancel_event
 
     def run(self):
         try:
@@ -865,6 +908,10 @@ class TranscribeWorker(threading.Thread):
             return
 
         try:
+            if self.cancel_event.is_set():
+                self.result_queue.put(("cancelled", None))
+                return
+
             self.result_queue.put((
                 "log",
                 f"Loading model '{self.model_name}' on {self.device} ({self.compute_type})..."
@@ -874,6 +921,10 @@ class TranscribeWorker(threading.Thread):
                 kwargs["cpu_threads"] = self.cpu_threads
 
             model = WhisperModel(self.model_name, **kwargs)
+
+            if self.cancel_event.is_set():
+                self.result_queue.put(("cancelled", None))
+                return
 
             lang = None if self.language == "auto" else self.language
             initial_prompt = self.initial_prompt.strip() or None
@@ -898,16 +949,29 @@ class TranscribeWorker(threading.Thread):
 
             segments = []
             for seg in segments_gen:
+                # segments_gen is lazy: faster-whisper decodes one segment
+                # per iteration, so checking here between iterations is a
+                # genuine, timely cancellation point (not just at the end).
+                if self.cancel_event.is_set():
+                    self.result_queue.put(("cancelled", None))
+                    return
                 segments.append(seg)
                 self.result_queue.put((
                     "log",
                     f"[{format_timestamp_vtt(seg.start)} -> {format_timestamp_vtt(seg.end)}] {seg.text.strip()}"
                 ))
 
+            if self.cancel_event.is_set():
+                self.result_queue.put(("cancelled", None))
+                return
+
             meta = dict(language=info.language, duration=getattr(info, "duration", None))
             self.result_queue.put(("transcribe_done", (segments, meta)))
         except Exception as e:
-            self.result_queue.put(("failed", f"Transcription failed: {e}\n{traceback.format_exc()}"))
+            if self.cancel_event.is_set():
+                self.result_queue.put(("cancelled", None))
+            else:
+                self.result_queue.put(("failed", f"Transcription failed: {e}\n{traceback.format_exc()}"))
 
 
 # ------------------------------------------------------------------------
@@ -930,6 +994,8 @@ class WhisperGUI(tk.Tk):
 
         self.result_queue: "queue.Queue" = queue.Queue()
         self.active_worker = None      # "download" | "transcribe" | None
+        self.current_worker_thread = None
+        self.cancel_event = threading.Event()
         self.current_audio_path = None
         self.last_segments = None
         self.last_meta = None
@@ -1222,8 +1288,12 @@ class WhisperGUI(tk.Tk):
     def _build_run_box(self, parent):
         box = self._labelframe(parent)
 
-        self.start_btn = ttk.Button(box, style="Accent.TButton", command=self._start)
-        self.start_btn.pack(fill="x")
+        btn_row = ttk.Frame(box, style="Panel.TFrame")
+        btn_row.pack(fill="x")
+        self.start_btn = ttk.Button(btn_row, style="Accent.TButton", command=self._start)
+        self.start_btn.pack(side="left", fill="x", expand=True)
+        self.stop_btn = ttk.Button(btn_row, style="Danger.TButton", command=self._stop, state="disabled")
+        self.stop_btn.pack(side="left", fill="x", expand=True, padx=(8, 0))
 
         self.progress = ttk.Progressbar(box, mode="indeterminate")
         # kept hidden until a job starts; packed on demand
@@ -1290,6 +1360,7 @@ class WhisperGUI(tk.Tk):
 
         self.run_box.configure(text=self.t("group_run"))
         self.start_btn.configure(text=self.t("start_btn"))
+        self.stop_btn.configure(text=self.t("stop_btn"))
 
         self._refresh_model_label()
         self._refresh_precision_label()
@@ -1520,6 +1591,7 @@ class WhisperGUI(tk.Tk):
 
     def _set_running(self, running: bool):
         self.start_btn.configure(state="disabled" if running else "normal")
+        self.stop_btn.configure(state="normal" if running else "disabled")
         if running:
             self.progress.pack(fill="x", pady=(8, 0), before=self.log_box)
             self.progress.start(12)
@@ -1540,6 +1612,11 @@ class WhisperGUI(tk.Tk):
         self.log_box.configure(state="normal")
         self.log_box.delete("1.0", "end")
         self.log_box.configure(state="disabled")
+
+        # Fresh cancel flag for this run -- a leftover set() from a prior
+        # cancelled job would otherwise make the very next job cancel itself
+        # instantly on its first checkpoint.
+        self.cancel_event = threading.Event()
         self._set_running(True)
 
         if self.source_var.get() == "url":
@@ -1551,7 +1628,8 @@ class WhisperGUI(tk.Tk):
             download_dir = os.path.join(out_dir, "downloads")
             self._log(self.t("starting_download", url=url))
             self.active_worker = "download"
-            worker = DownloadWorker(url, download_dir, self.result_queue)
+            worker = DownloadWorker(url, download_dir, self.result_queue, self.cancel_event)
+            self.current_worker_thread = worker
             worker.start()
         else:
             path = self.file_path_var.get().strip()
@@ -1560,6 +1638,19 @@ class WhisperGUI(tk.Tk):
                 self._set_running(False)
                 return
             self._begin_transcription(path)
+
+    def _stop(self):
+        # Cooperative cancellation only: this signals the running worker's
+        # next checkpoint (yt-dlp hook call, or the next decoded segment) to
+        # unwind. It cannot interrupt a single blocking call already inside
+        # a C/native extension (e.g. mid-write of one whisper decode step),
+        # so there can be a short delay between clicking Stop and the
+        # "cancelled" message actually arriving.
+        if self.active_worker is None:
+            return
+        self.cancel_event.set()
+        self.stop_btn.configure(state="disabled")
+        self._log(self.t("stopping"))
 
     def _begin_transcription(self, audio_path: str):
         self.current_audio_path = audio_path
@@ -1577,6 +1668,10 @@ class WhisperGUI(tk.Tk):
 
         self._log(self.t("model_device_line", model=m["name"], device=device, compute=ct["name"]))
         self.active_worker = "transcribe"
+        # Downloading a URL enables the Stop button before this method runs;
+        # make sure it's still enabled now that we've moved into the
+        # transcription phase (in case a fast download disabled it).
+        self.stop_btn.configure(state="normal")
         worker = TranscribeWorker(
             audio_path=audio_path,
             model_name=m["name"],
@@ -1590,7 +1685,9 @@ class WhisperGUI(tk.Tk):
             beam_size=beam,
             cpu_threads=threads,
             result_queue=self.result_queue,
+            cancel_event=self.cancel_event,
         )
+        self.current_worker_thread = worker
         worker.start()
 
     def _poll_queue(self):
@@ -1607,6 +1704,11 @@ class WhisperGUI(tk.Tk):
                     self.active_worker = None
                     segments, meta = payload
                     self._on_transcribe_finished(segments, meta)
+                elif kind == "cancelled":
+                    self.active_worker = None
+                    self.current_worker_thread = None
+                    self._set_running(False)
+                    self._log(self.t("cancelled_log"))
                 elif kind == "failed":
                     self.active_worker = None
                     self._on_worker_failed(payload)
