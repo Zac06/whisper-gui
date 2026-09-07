@@ -22,10 +22,16 @@ The script manages its own dependencies in a Venv.
 
 Everything else is downloaded and installed on-the-run.
 
-## Running
+## Downloading
 
 ```
 git clone https://github.com/Zac06/whisper-gui.git
+```
+
+## Running
+
+From the same folder you downloaded:
+```
 cd whisper-gui
 python3 whisper.py
 ```
