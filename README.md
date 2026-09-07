@@ -2,7 +2,7 @@
 
 A self-contained desktop app for transcribing audio/video with [faster-whisper](https://github.com/SYSTRAN/faster-whisper). 
 
-The UI was built entirely on Python's standard library UI toolkit to reduce dependencies.
+The UI was built using PySide6.
 
 The script manages its own dependencies in a Venv.
 
@@ -12,12 +12,7 @@ The script manages its own dependencies in a Venv.
 
 ## Requirements
 
-- Python 3.9+ with **Tk/tkinter** available.
-  - Debian/Ubuntu: `sudo apt install python3-tk`
-  - Fedora: `sudo dnf install python3-tkinter`
-  - Arch: `sudo pacman -S tk`
-  - macOS (Homebrew): `brew install python-tk`
-  - Windows: included with the standard python.org installer
+- Python 3.9+
 - Internet access on first run, to install dependencies and (optionally) download a `ffmpeg` build in the PATH. Otherwise, the script downloads its own `static-ffmpeg` binary.
 
 Everything else is downloaded and installed on-the-run.
