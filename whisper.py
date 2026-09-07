@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 """
-Faster-Whisper GUI (Tkinter Edition, self-bootstrapping)
-==========================================================
+Faster-Whisper GUI (Qt / PySide6 Edition, self-bootstrapping)
+================================================================
 
-A desktop front-end for faster-whisper, built entirely on Python's standard
-library for the UI layer (tkinter/ttk). No Qt, no platform icon themes, no
-dependency on the OS's dark-mode / icon-theme plumbing -- the whole interface
-draws its own fixed color palette, so it looks the same everywhere and can't
-throw errors like "kf.iconthemes: Icon theme not found" (that was a
-KDE/Plasma-integration warning coming from PyQt/KDE Frameworks, which this
-rewrite has no contact with at all).
+A desktop front-end for faster-whisper, built on PySide6 (Qt for Python).
+
 
 Fully autonomous startup
 -------------------------
@@ -19,16 +14,12 @@ This script manages its own dependencies. On every run it:
      works out of the box on "externally managed" systems (PEP 668 /
      Debian's `error: externally-managed-environment`) without ever touching
      the system Python or requiring --break-system-packages.
-  2. Verifies the required third-party packages are importable inside that
-     venv, and installs/repairs them with the venv's own pip if not.
+  2. Verifies the required third-party packages (including PySide6) are
+     importable inside that venv, and installs/repairs them with the venv's
+     own pip if not.
   3. Re-executes itself using the venv's Python interpreter.
   4. At runtime, if `ffmpeg` isn't found on PATH, it transparently falls
      back to a portable build fetched via the `static-ffmpeg` package.
-
-The only thing this script cannot install for you is Tk/tkinter itself --
-that's a compiled extension tied to your system Python, not a pip package.
-If it's missing, the script tells you the exact command to install it
-(e.g. `sudo apt install python3-tk`) and exits.
 
 Command-line flags (all optional)
 ----------------------------------
@@ -57,14 +48,13 @@ Features
       transcript's first segment.
     * hotwords        -- words whose log-probabilities are boosted during
       decoding, without consuming any prompt/context budget.
-- VAD (Voice Activity Detection) filter checkbox with a custom hover tooltip.
+- VAD (Voice Activity Detection) filter checkbox with a hover tooltip.
 - Interface available in English and Italian (Italian by default).
-- Two-column, scrollable layout with a self-contained dark theme.
 - Stop button to cancel an in-progress download or transcription.
 
 Run
 ---
-    python3 whisper_gui_tk.py
+    python3 whisper_gui_qt.py
 """
 
 import os
@@ -81,52 +71,34 @@ import subprocess
 import venv as _venv_mod
 from pathlib import Path
 
-_BOOTSTRAP_MARKER = "WHISPER_GUI_TK_VENV_ACTIVE"
-_REQUIRED_PACKAGES = ["faster-whisper", "yt-dlp", "psutil", "static-ffmpeg"]
+_BOOTSTRAP_MARKER = "WHISPER_GUI_QT_VENV_ACTIVE"
+_REQUIRED_PACKAGES = ["faster-whisper", "yt-dlp", "psutil", "static-ffmpeg", "PySide6"]
 _OPTIONAL_TORCH_PACKAGE = "torch"
 
 
 def _default_venv_dir() -> Path:
     """Pick a writable location for the managed venv: next to this script
     if that directory is writable, otherwise a per-user data directory.
-    Overridable via the WHISPER_GUI_TK_VENV_DIR environment variable."""
-    override = os.environ.get("WHISPER_GUI_TK_VENV_DIR")
+    Overridable via the WHISPER_GUI_QT_VENV_DIR environment variable."""
+    override = os.environ.get("WHISPER_GUI_QT_VENV_DIR")
     if override:
         return Path(override).expanduser().resolve()
 
     script_dir = Path(__file__).resolve().parent
     if os.access(script_dir, os.W_OK):
-        return script_dir / ".whisper_gui_venv"
+        return script_dir / ".whisper_gui_qt_venv"
 
     if os.name == "nt":
         base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
     else:
         base = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
-    return base / "whisper-gui-tk" / "venv"
+    return base / "whisper-gui-qt" / "venv"
 
 
 def _venv_python_path(venv_dir: Path) -> Path:
     if os.name == "nt":
         return venv_dir / "Scripts" / "python.exe"
     return venv_dir / "bin" / "python"
-
-
-def _check_tkinter_or_exit():
-    try:
-        import tkinter  # noqa: F401
-    except ImportError:
-        sys.stderr.write(
-            "\nTkinter is not available in this Python installation.\n"
-            "This is a compiled component tied to your system Python, so it "
-            "can't be installed via pip / a virtual environment -- it has to "
-            "come from your OS package manager. Try one of:\n"
-            "    Debian/Ubuntu:  sudo apt install python3-tk\n"
-            "    Fedora:         sudo dnf install python3-tkinter\n"
-            "    Arch:           sudo pacman -S tk\n"
-            "    macOS (brew):   brew install python-tk\n"
-            "Then re-run this script.\n\n"
-        )
-        sys.exit(1)
 
 
 def _create_venv(venv_dir: Path):
@@ -145,7 +117,7 @@ def _create_venv(venv_dir: Path):
 
 
 def _deps_importable(venv_python: Path, with_torch: bool) -> bool:
-    modules = ["faster_whisper", "yt_dlp", "psutil", "static_ffmpeg"]
+    modules = ["faster_whisper", "yt_dlp", "psutil", "static_ffmpeg", "PySide6.QtWidgets"]
     if with_torch:
         modules.append("torch")
     code = "import " + ", ".join(modules)
@@ -177,7 +149,10 @@ def _bootstrap():
     if os.environ.get(_BOOTSTRAP_MARKER) == "1":
         return  # already inside the managed venv -- nothing left to do
 
-    _check_tkinter_or_exit()
+    # Note: unlike the Tkinter edition, there is no OS-level toolkit check
+    # here. PySide6 is a self-contained pip wheel (it bundles Qt itself),
+    # so it's installed the same way as every other dependency below --
+    # no "install this via your OS package manager" step required.
 
     args = sys.argv[1:]
     with_torch = "--with-torch" in args
@@ -217,13 +192,17 @@ _bootstrap()
 
 import shutil
 import threading
-import queue
 import traceback
 from datetime import datetime
 
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-from tkinter import scrolledtext
+from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QFont
+from PySide6.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+    QGroupBox, QLabel, QPushButton, QComboBox, QLineEdit, QRadioButton,
+    QCheckBox, QSpinBox, QSlider, QProgressBar, QPlainTextEdit, QScrollArea,
+    QFileDialog, QMessageBox, QFrame,
+)
 
 # ------------------------------------------------------------------------
 # Optional dependencies (detected gracefully; torch is only installed if
@@ -256,6 +235,7 @@ def ensure_ffmpeg_available() -> bool:
 
 # ------------------------------------------------------------------------
 # Static data: models, compute types, languages, prompt presets
+# (Framework-agnostic -- unchanged from the Tkinter edition.)
 # ------------------------------------------------------------------------
 
 MODEL_TABLE = [
@@ -448,6 +428,8 @@ TR = {
         "select_file_dialog": "Select audio or video file",
         "select_out_dialog": "Select output folder",
         "done_files_log": "Done. Files:",
+        "media_filter": "Media files (*.mp3 *.wav *.m4a *.flac *.ogg *.mp4 *.mkv *.mov *.avi *.webm)",
+        "all_files_filter": "All files (*.*)",
     },
     "it": {
         "window_title": "Faster-Whisper GUI",
@@ -542,6 +524,8 @@ TR = {
         "select_file_dialog": "Seleziona file audio o video",
         "select_out_dialog": "Seleziona cartella di output",
         "done_files_log": "Completato. File:",
+        "media_filter": "File multimediali (*.mp3 *.wav *.m4a *.flac *.ogg *.mp4 *.mkv *.mov *.avi *.webm)",
+        "all_files_filter": "Tutti i file (*.*)",
     },
 }
 
@@ -559,7 +543,7 @@ def format_timestamp_vtt(seconds: float) -> str:
 
 
 # ------------------------------------------------------------------------
-# Hardware detection helpers
+# Hardware detection helpers (unchanged from the Tkinter edition)
 # ------------------------------------------------------------------------
 
 def get_gpu_info():
@@ -595,220 +579,50 @@ def estimate_memory_gb(model_info, compute_info):
     return round(model_info["base_gb"] * compute_info["mult"], 2)
 
 
-# ------------------------------------------------------------------------
-# Self-contained dark palette + ttk theme
-# (Deliberately fixed, not derived from the OS theme, so the app looks and
-#  behaves the same on every machine and desktop environment.)
-# ------------------------------------------------------------------------
+class InfoDot(QLabel):
+    """Small circular "i" info button with a hover tooltip -- the Qt build-in
+    QToolTip mechanism replaces the custom hover-popup class the Tkinter
+    edition needed (Tk has no native widget tooltip support)."""
 
-PALETTE = {
-    "bg":            "#1b1d24",
-    "bg_header":     "#15161c",
-    "panel":         "#232631",
-    "panel_alt":     "#262a37",
-    "panel_border":  "#343849",
-    "accent":        "#5b8cff",
-    "accent_hover":  "#7aa2ff",
-    "accent_active": "#3f6fe0",
-    "text":          "#e8eaf0",
-    "text_dim":      "#a4aab8",
-    "text_faint":    "#767c8c",
-    "entry_bg":      "#2a2e3b",
-    "entry_fg":      "#e8eaf0",
-    "success":       "#4fbf85",
-    "warn":          "#e0a13c",
-    "danger":        "#e2635f",
-    "tooltip_bg":    "#2f3342",
-    "tooltip_fg":    "#e8eaf0",
-    "log_bg":        "#14151b",
-    "log_fg":        "#c9cedb",
-}
+    def __init__(self, text_getter, parent=None, size=18):
+        super().__init__("i", parent)
+        self.setObjectName("infoDot")
+        self.setFixedSize(size, size)
+        self.setAlignment(Qt.AlignCenter)
+        self.setCursor(Qt.PointingHandCursor)
+        self._text_getter = text_getter
+        self.refresh_tooltip()
 
-FONT_BASE = ("Segoe UI", 10)
-FONT_BOLD = ("Segoe UI", 10, "bold")
-FONT_HEADER = ("Segoe UI", 16, "bold")
-FONT_SMALL = ("Segoe UI", 9)
-FONT_MONO = ("Consolas", 9)
-
-
-def apply_theme(root: tk.Tk, palette: dict) -> ttk.Style:
-    root.configure(bg=palette["bg"])
-    style = ttk.Style(root)
-    # "clam" is the only bundled ttk theme that fully honors color overrides
-    # on every platform, which is exactly what we need for a fixed look.
-    style.theme_use("clam")
-
-    style.configure(".", background=palette["bg"], foreground=palette["text"],
-                     fieldbackground=palette["entry_bg"], font=FONT_BASE,
-                     bordercolor=palette["panel_border"])
-
-    style.configure("TFrame", background=palette["bg"])
-    style.configure("Panel.TFrame", background=palette["panel"])
-    style.configure("Header.TFrame", background=palette["bg_header"])
-
-    style.configure("TLabel", background=palette["bg"], foreground=palette["text"])
-    style.configure("Panel.TLabel", background=palette["panel"], foreground=palette["text"])
-    style.configure("Dim.TLabel", background=palette["panel"], foreground=palette["text_dim"])
-    style.configure("Hint.TLabel", background=palette["panel"], foreground=palette["text_faint"], font=FONT_SMALL)
-    style.configure("Title.TLabel", background=palette["panel"], foreground=palette["text"], font=FONT_BOLD)
-    style.configure("Header.TLabel", background=palette["bg_header"], foreground=palette["accent"], font=FONT_HEADER)
-    style.configure("Estimate.TLabel", background=palette["panel"], font=FONT_BOLD)
-
-    style.configure("TLabelframe", background=palette["panel"],
-                     bordercolor=palette["panel_border"], darkcolor=palette["panel_border"],
-                     lightcolor=palette["panel_border"], relief="solid", borderwidth=1)
-    style.configure("TLabelframe.Label", background=palette["panel"],
-                     foreground=palette["accent"], font=FONT_BOLD)
-
-    style.configure("TButton", background=palette["panel_alt"], foreground=palette["text"],
-                     borderwidth=0, focuscolor=palette["accent"], padding=(10, 6))
-    style.map("TButton",
-              background=[("active", palette["accent_hover"]), ("pressed", palette["accent_active"])],
-              foreground=[("disabled", palette["text_faint"])])
-
-    style.configure("Accent.TButton", background=palette["accent"], foreground="#ffffff",
-                     padding=(16, 9), font=FONT_BOLD, borderwidth=0)
-    style.map("Accent.TButton",
-              background=[("active", palette["accent_hover"]), ("pressed", palette["accent_active"]),
-                          ("disabled", palette["panel_border"])],
-              foreground=[("disabled", palette["text_faint"])])
-
-    style.configure("Danger.TButton", background=palette["danger"], foreground="#ffffff",
-                     padding=(16, 9), font=FONT_BOLD, borderwidth=0)
-    style.map("Danger.TButton",
-              background=[("active", "#ef8480"), ("pressed", "#c94f4b"),
-                          ("disabled", palette["panel_border"])],
-              foreground=[("disabled", palette["text_faint"])])
-
-    style.configure("TEntry", fieldbackground=palette["entry_bg"], foreground=palette["entry_fg"],
-                     bordercolor=palette["panel_border"], insertcolor=palette["text"],
-                     lightcolor=palette["entry_bg"], darkcolor=palette["entry_bg"])
-    style.map("TEntry", bordercolor=[("focus", palette["accent"])])
-
-    style.configure("TCombobox", fieldbackground=palette["entry_bg"], background=palette["entry_bg"],
-                     foreground=palette["entry_fg"], arrowcolor=palette["text"],
-                     bordercolor=palette["panel_border"])
-    style.map("TCombobox",
-              fieldbackground=[("readonly", palette["entry_bg"]), ("disabled", palette["panel"])],
-              foreground=[("disabled", palette["text_faint"])])
-
-    style.configure("TCheckbutton", background=palette["panel"], foreground=palette["text"])
-    style.map("TCheckbutton", background=[("active", palette["panel"])],
-              indicatorcolor=[("selected", palette["accent"]), ("!selected", palette["entry_bg"])])
-
-    style.configure("TRadiobutton", background=palette["panel"], foreground=palette["text"])
-    style.map("TRadiobutton", background=[("active", palette["panel"])],
-              indicatorcolor=[("selected", palette["accent"]), ("!selected", palette["entry_bg"])])
-
-    style.configure("TSpinbox", fieldbackground=palette["entry_bg"], foreground=palette["entry_fg"],
-                     arrowcolor=palette["text"], bordercolor=palette["panel_border"])
-
-    style.configure("Horizontal.TScale", background=palette["panel"], troughcolor=palette["entry_bg"])
-
-    style.configure("Horizontal.TProgressbar", background=palette["accent"],
-                     troughcolor=palette["entry_bg"], bordercolor=palette["panel_border"],
-                     lightcolor=palette["accent"], darkcolor=palette["accent"])
-
-    style.configure("TSeparator", background=palette["panel_border"])
-
-    # Combobox popdown listbox colors aren't ttk-styleable directly.
-    root.option_add("*TCombobox*Listbox.background", palette["entry_bg"])
-    root.option_add("*TCombobox*Listbox.foreground", palette["entry_fg"])
-    root.option_add("*TCombobox*Listbox.selectBackground", palette["accent"])
-    root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
-    root.option_add("*TCombobox*Listbox.font", FONT_BASE)
-
-    return style
-
-
-class ToolTip:
-    """Lightweight hover tooltip for any tkinter/ttk widget.
-
-    text_getter is a zero-arg callable so the tooltip content stays correct
-    across UI-language switches without needing to be rebound.
-    """
-
-    def __init__(self, widget, text_getter, palette, wraplength=380):
-        self.widget = widget
-        self.text_getter = text_getter
-        self.palette = palette
-        self.wraplength = wraplength
-        self.tipwindow = None
-        widget.bind("<Enter>", self.show, add="+")
-        widget.bind("<Leave>", self.hide, add="+")
-        widget.bind("<ButtonPress>", self.hide, add="+")
-
-    def show(self, _event=None):
-        text = self.text_getter()
-        if not text or self.tipwindow is not None:
-            return
-        x = self.widget.winfo_rootx() + 12
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
-        tw = tk.Toplevel(self.widget)
-        tw.wm_overrideredirect(True)
-        try:
-            tw.wm_attributes("-topmost", True)
-        except tk.TclError:
-            pass
-        tw.wm_geometry(f"+{x}+{y}")
-        frame = tk.Frame(tw, background=self.palette["accent"], bd=0)
-        frame.pack(padx=0, pady=0)
-        inner = tk.Frame(frame, background=self.palette["tooltip_bg"])
-        inner.pack(padx=1, pady=1)
-        label = tk.Label(
-            inner, text=text, justify="left", background=self.palette["tooltip_bg"],
-            foreground=self.palette["tooltip_fg"], font=FONT_SMALL,
-            wraplength=self.wraplength, padx=10, pady=8,
-        )
-        label.pack()
-        self.tipwindow = tw
-
-    def hide(self, _event=None):
-        if self.tipwindow is not None:
-            self.tipwindow.destroy()
-            self.tipwindow = None
-
-
-class InfoDot(tk.Canvas):
-    """Small circular "i" info button with a hover tooltip, replacing the
-    QToolButton bubble from the PyQt version."""
-
-    def __init__(self, parent, text_getter, palette, size=20):
-        super().__init__(parent, width=size, height=size, background=palette["panel"],
-                          highlightthickness=0, bd=0, cursor="question_arrow")
-        self.palette = palette
-        self.size = size
-        self._draw()
-        self.tooltip = ToolTip(self, text_getter, palette)
-
-    def _draw(self):
-        p = self.palette
-        s = self.size
-        self.create_oval(1, 1, s - 1, s - 1, outline=p["accent"], width=1.4, fill=p["panel_alt"])
-        self.create_text(s / 2, s / 2, text="i", fill=p["accent"], font=("Segoe UI", 9, "bold"))
+    def refresh_tooltip(self):
+        self.setToolTip(self._text_getter())
 
 
 # ------------------------------------------------------------------------
-# Background worker threads (communicate back to the Tk main loop via a
-# thread-safe queue, polled with root.after -- Tk widgets must only be
-# touched from the main thread).
+# Background worker threads. Each is a QThread subclass communicating back
+# to the GUI thread via Qt signals -- PySide6 automatically marshals these
+# across threads (queued connections), so unlike the Tkinter edition there
+# is no manual queue + polling timer required.
 #
 # Both workers accept a threading.Event `cancel_event`. They check it at
 # every safe checkpoint (yt-dlp's progress hook; each transcribed segment)
-# and unwind cooperatively -- there is no way to hard-kill a Python thread,
-# so cancellation is always "please stop soon", not "stop now".
+# and unwind cooperatively -- there is no way to hard-kill a thread, so
+# cancellation is always "please stop soon", not "stop now".
 # ------------------------------------------------------------------------
 
 class CancelledError(Exception):
     """Raised internally to unwind a worker once cancellation is requested."""
 
 
-class DownloadWorker(threading.Thread):
-    def __init__(self, url: str, out_dir: str, result_queue: "queue.Queue", cancel_event: "threading.Event"):
-        super().__init__(daemon=True)
+class DownloadWorker(QThread):
+    log = Signal(str)
+    download_done = Signal(str)
+    cancelled = Signal()
+    failed = Signal(str)
+
+    def __init__(self, url: str, out_dir: str, cancel_event: "threading.Event", parent=None):
+        super().__init__(parent)
         self.url = url
         self.out_dir = out_dir
-        self.result_queue = result_queue
         self.cancel_event = cancel_event
         self._final_path = None
 
@@ -820,16 +634,16 @@ class DownloadWorker(threading.Thread):
         if d.get("status") == "downloading":
             pct = d.get("_percent_str", "").strip()
             speed = d.get("_speed_str", "").strip()
-            self.result_queue.put(("log", f"Downloading... {pct} ({speed})"))
+            self.log.emit(f"Downloading... {pct} ({speed})")
         elif d.get("status") == "finished":
             self._final_path = d.get("filename")
-            self.result_queue.put(("log", "Download finished, extracting audio..."))
+            self.log.emit("Download finished, extracting audio...")
 
     def run(self):
         try:
             import yt_dlp
         except ImportError:
-            self.result_queue.put(("failed", "yt-dlp is not installed. Run: pip install yt-dlp"))
+            self.failed.emit("yt-dlp is not installed. Run: pip install yt-dlp")
             return
 
         os.makedirs(self.out_dir, exist_ok=True)
@@ -851,41 +665,46 @@ class DownloadWorker(threading.Thread):
             if self.cancel_event.is_set():
                 raise CancelledError("cancelled before download started")
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                self.result_queue.put(("log", f"Fetching info for: {self.url}"))
+                self.log.emit(f"Fetching info for: {self.url}")
                 ydl.download([self.url])
 
             if self.cancel_event.is_set():
                 raise CancelledError("cancelled after download")
 
             if not self._final_path:
-                self.result_queue.put(("failed", "Download completed but no output file was captured."))
+                self.failed.emit("Download completed but no output file was captured.")
                 return
 
             wav_path = os.path.splitext(self._final_path)[0] + ".wav"
             if os.path.exists(wav_path):
-                self.result_queue.put(("download_done", wav_path))
+                self.download_done.emit(wav_path)
             elif os.path.exists(self._final_path):
-                self.result_queue.put(("download_done", self._final_path))
+                self.download_done.emit(self._final_path)
             else:
-                self.result_queue.put(("failed", "Could not locate the downloaded/extracted audio file."))
+                self.failed.emit("Could not locate the downloaded/extracted audio file.")
         except CancelledError:
-            self.result_queue.put(("cancelled", None))
+            self.cancelled.emit()
         except Exception as e:
             # yt-dlp wraps hook exceptions in its own DownloadError; if our
             # CancelledError is the root cause, still report it as a clean
             # cancellation rather than a failure.
             if self.cancel_event.is_set():
-                self.result_queue.put(("cancelled", None))
+                self.cancelled.emit()
             else:
-                self.result_queue.put(("failed", f"Download failed: {e}\n{traceback.format_exc()}"))
+                self.failed.emit(f"Download failed: {e}\n{traceback.format_exc()}")
 
 
-class TranscribeWorker(threading.Thread):
+class TranscribeWorker(QThread):
+    log = Signal(str)
+    transcribe_done = Signal(object, object)  # (segments: list, meta: dict)
+    cancelled = Signal()
+    failed = Signal(str)
+
     def __init__(self, audio_path, model_name, device, compute_type,
                  language, initial_prompt, prefix, hotwords,
-                 vad_filter, beam_size, cpu_threads, result_queue: "queue.Queue",
-                 cancel_event: "threading.Event"):
-        super().__init__(daemon=True)
+                 vad_filter, beam_size, cpu_threads,
+                 cancel_event: "threading.Event", parent=None):
+        super().__init__(parent)
         self.audio_path = audio_path
         self.model_name = model_name
         self.device = device
@@ -897,25 +716,23 @@ class TranscribeWorker(threading.Thread):
         self.vad_filter = vad_filter
         self.beam_size = beam_size
         self.cpu_threads = cpu_threads
-        self.result_queue = result_queue
         self.cancel_event = cancel_event
 
     def run(self):
         try:
             from faster_whisper import WhisperModel
         except ImportError:
-            self.result_queue.put(("failed", "faster-whisper is not installed. Run: pip install faster-whisper"))
+            self.failed.emit("faster-whisper is not installed. Run: pip install faster-whisper")
             return
 
         try:
             if self.cancel_event.is_set():
-                self.result_queue.put(("cancelled", None))
+                self.cancelled.emit()
                 return
 
-            self.result_queue.put((
-                "log",
+            self.log.emit(
                 f"Loading model '{self.model_name}' on {self.device} ({self.compute_type})..."
-            ))
+            )
             kwargs = dict(device=self.device, compute_type=self.compute_type)
             if self.device == "cpu":
                 kwargs["cpu_threads"] = self.cpu_threads
@@ -923,7 +740,7 @@ class TranscribeWorker(threading.Thread):
             model = WhisperModel(self.model_name, **kwargs)
 
             if self.cancel_event.is_set():
-                self.result_queue.put(("cancelled", None))
+                self.cancelled.emit()
                 return
 
             lang = None if self.language == "auto" else self.language
@@ -931,7 +748,7 @@ class TranscribeWorker(threading.Thread):
             prefix = self.prefix.strip() or None
             hotwords = self.hotwords.strip() or None
 
-            self.result_queue.put(("log", "Starting transcription..."))
+            self.log.emit("Starting transcription...")
             segments_gen, info = model.transcribe(
                 self.audio_path,
                 language=lang,
@@ -942,10 +759,9 @@ class TranscribeWorker(threading.Thread):
                 beam_size=self.beam_size,
             )
 
-            self.result_queue.put((
-                "log",
+            self.log.emit(
                 f"Detected language: {info.language} (probability {info.language_probability:.2f})"
-            ))
+            )
 
             segments = []
             for seg in segments_gen:
@@ -953,46 +769,38 @@ class TranscribeWorker(threading.Thread):
                 # per iteration, so checking here between iterations is a
                 # genuine, timely cancellation point (not just at the end).
                 if self.cancel_event.is_set():
-                    self.result_queue.put(("cancelled", None))
+                    self.cancelled.emit()
                     return
                 segments.append(seg)
-                self.result_queue.put((
-                    "log",
+                self.log.emit(
                     f"[{format_timestamp_vtt(seg.start)} -> {format_timestamp_vtt(seg.end)}] {seg.text.strip()}"
-                ))
+                )
 
             if self.cancel_event.is_set():
-                self.result_queue.put(("cancelled", None))
+                self.cancelled.emit()
                 return
 
             meta = dict(language=info.language, duration=getattr(info, "duration", None))
-            self.result_queue.put(("transcribe_done", (segments, meta)))
+            self.transcribe_done.emit(segments, meta)
         except Exception as e:
             if self.cancel_event.is_set():
-                self.result_queue.put(("cancelled", None))
+                self.cancelled.emit()
             else:
-                self.result_queue.put(("failed", f"Transcription failed: {e}\n{traceback.format_exc()}"))
+                self.failed.emit(f"Transcription failed: {e}\n{traceback.format_exc()}")
 
 
 # ------------------------------------------------------------------------
-# Main application
+# Main application window
 # ------------------------------------------------------------------------
 
-class WhisperGUI(tk.Tk):
+class WhisperGUI(QWidget):
     def __init__(self):
         super().__init__()
-        self.palette = PALETTE
         self.lang = "it"
-        self.title("Faster-Whisper GUI")
-        self.geometry("1180x820")
-        self.minsize(760, 480)
-
-        self.style = apply_theme(self, self.palette)
 
         self.has_cuda, self.gpu_name, self.vram_gb = get_gpu_info()
         self.ram_gb = get_ram_gb()
 
-        self.result_queue: "queue.Queue" = queue.Queue()
         self.active_worker = None      # "download" | "transcribe" | None
         self.current_worker_thread = None
         self.cancel_event = threading.Event()
@@ -1000,31 +808,9 @@ class WhisperGUI(tk.Tk):
         self.last_segments = None
         self.last_meta = None
 
-        # tk variables
-        self.ui_lang_var = tk.StringVar(value="Italiano")
-        self.device_var = tk.StringVar(value="cuda" if self.has_cuda else "cpu")
-        self.cpu_threads_var = tk.IntVar(value=4)
-        self.ability_var = tk.IntVar(value=4)
-        self.precision_var = tk.IntVar(value=2)
-        self.source_var = tk.StringVar(value="file")
-        self.file_path_var = tk.StringVar()
-        self.url_var = tk.StringVar()
-        self.out_dir_var = tk.StringVar(value=os.path.join(os.path.expanduser("~"), "whisper_output"))
-        self.lang_display_var = tk.StringVar()
-        self.style_display_var = tk.StringVar()
-        self.initial_prompt_custom_var = tk.StringVar()
-        self.prefix_var = tk.StringVar()
-        self.hotwords_var = tk.StringVar()
-        self.vad_var = tk.BooleanVar(value=True)
-        self.beam_var = tk.IntVar(value=5)
-        self.fmt_txt_var = tk.BooleanVar(value=True)
-        self.fmt_srt_var = tk.BooleanVar(value=True)
-        self.fmt_vtt_var = tk.BooleanVar(value=False)
-
-        self._lang_code_by_display = {}
-        self._display_by_lang_code = {}
-        self._style_key_by_display = {}
-        self._display_by_style_key = {}
+        self.setWindowTitle("faster-whisper GUI")
+        self.resize(1180, 820)
+        self.setMinimumSize(760, 480)
 
         self._build_ui()
         self.retranslate_ui()
@@ -1033,8 +819,6 @@ class WhisperGUI(tk.Tk):
         self._refresh_precision_combo_targets()
         self._update_estimate()
 
-        self.after(100, self._poll_queue)
-
     def t(self, key, **fmt):
         text = TR[self.lang].get(key, key)
         return text.format(**fmt) if fmt else text
@@ -1042,398 +826,439 @@ class WhisperGUI(tk.Tk):
     # ---------------------------- UI BUILD ----------------------------
 
     def _build_ui(self):
-        p = self.palette
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
         # Header bar
-        header = ttk.Frame(self, style="Header.TFrame", padding=(18, 14))
-        header.pack(fill="x", side="top")
-        self.header_label = ttk.Label(header, style="Header.TLabel")
-        self.header_label.pack(side="left")
+        header = QFrame()
+        header.setObjectName("headerBar")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(18, 14, 18, 14)
+        self.header_label = QLabel()
+        self.header_label.setObjectName("headerTitle")
+        #self.header_label.setFont(self.fonts["header"])
+        header_layout.addWidget(self.header_label)
+        header_layout.addStretch(1)
 
-        lang_box = ttk.Frame(header, style="Header.TFrame")
-        lang_box.pack(side="right")
-        self.ui_lang_label = tk.Label(lang_box, background=p["bg_header"], foreground=p["text_dim"], font=FONT_BASE)
-        self.ui_lang_label.pack(side="left", padx=(0, 8))
-        self.ui_lang_combo = ttk.Combobox(lang_box, textvariable=self.ui_lang_var, state="readonly",
-                                           width=12, values=["English", "Italiano"])
-        self.ui_lang_combo.pack(side="left")
-        self.ui_lang_combo.bind("<<ComboboxSelected>>", self._on_ui_lang_changed)
+        self.ui_lang_label = QLabel()
+        header_layout.addWidget(self.ui_lang_label)
+        self.ui_lang_combo = QComboBox()
+        self.ui_lang_combo.addItems(["English", "Italiano"])
+        self.ui_lang_combo.setCurrentText("Italiano")
+        self.ui_lang_combo.setFixedWidth(130)
+        self.ui_lang_combo.currentTextChanged.connect(self._on_ui_lang_changed)
+        header_layout.addWidget(self.ui_lang_combo)
 
-        # Scrollable body -- a Canvas + Scrollbar wrapping the real content
-        # frame. This is what keeps every panel reachable in a normal,
-        # un-maximized window on a 1080p (or smaller) screen: instead of the
-        # window needing to be tall enough to fit everything at once, the
-        # content simply scrolls.
-        scroll_container = ttk.Frame(self)
-        scroll_container.pack(fill="both", expand=True)
+        root.addWidget(header)
 
-        canvas = tk.Canvas(scroll_container, background=p["bg"], highlightthickness=0, bd=0)
-        vscroll = ttk.Scrollbar(scroll_container, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vscroll.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        vscroll.pack(side="right", fill="y")
+        # Scrollable body -- QScrollArea handles smooth, natively-performant
+        # scrolling on every platform; no manual Canvas/scrollregion/wheel-
+        # binding plumbing needed here (that was the laggiest part of the
+        # Tkinter edition on macOS).
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        body = QWidget()
+        scroll.setWidget(body)
+        root.addWidget(scroll, 1)
 
-        body = ttk.Frame(canvas, padding=(14, 10, 14, 14))
-        body_window = canvas.create_window((0, 0), window=body, anchor="nw")
+        body_layout = QHBoxLayout(body)
+        body_layout.setContentsMargins(14, 10, 14, 14)
+        body_layout.setSpacing(14)
 
-        def _on_body_configure(_event=None):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-
-        def _on_canvas_configure(event):
-            canvas.itemconfig(body_window, width=event.width)
-
-        body.bind("<Configure>", _on_body_configure)
-        canvas.bind("<Configure>", _on_canvas_configure)
-
-        def _on_mousewheel(event):
-            if event.num == 4:
-                canvas.yview_scroll(-1, "units")
-            elif event.num == 5:
-                canvas.yview_scroll(1, "units")
-            else:
-                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)   # Windows / macOS
-        canvas.bind_all("<Button-4>", _on_mousewheel)      # Linux scroll up
-        canvas.bind_all("<Button-5>", _on_mousewheel)      # Linux scroll down
-
-        body.columnconfigure(0, weight=1)
-        body.columnconfigure(1, weight=1)
-
-        left_col = ttk.Frame(body)
-        left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
-        right_col = ttk.Frame(body)
-        right_col.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
+        left_col = QVBoxLayout()
+        left_col.setSpacing(10)
+        right_col = QVBoxLayout()
+        right_col.setSpacing(10)
+        body_layout.addLayout(left_col, 1)
+        body_layout.addLayout(right_col, 1)
 
         # Left column: hardware -> model selection -> run panel.
-        self.hardware_box = self._build_hardware_box(left_col)
-        self.hardware_box.pack(fill="x", pady=(0, 10))
-        self.model_box = self._build_model_box(left_col)
-        self.model_box.pack(fill="x", pady=(0, 10))
-        self.run_box = self._build_run_box(left_col)
-        self.run_box.pack(fill="both", expand=True)
+        self.hardware_box = self._build_hardware_box()
+        left_col.addWidget(self.hardware_box)
+        self.model_box = self._build_model_box()
+        left_col.addWidget(self.model_box)
+        self.run_box = self._build_run_box()
+        left_col.addWidget(self.run_box, 1)
 
         # Right column: source -> options, sitting alongside the run panel.
-        self.source_box = self._build_source_box(right_col)
-        self.source_box.pack(fill="x", pady=(0, 10))
-        self.options_box = self._build_options_box(right_col)
-        self.options_box.pack(fill="both", expand=True)
+        self.source_box = self._build_source_box()
+        right_col.addWidget(self.source_box)
+        self.options_box = self._build_options_box()
+        right_col.addWidget(self.options_box, 1)
 
-    def _labelframe(self, parent, **kwargs):
-        return ttk.LabelFrame(parent, padding=(14, 10), **kwargs)
+    def _title_label(self, text=""):
+        lbl = QLabel(text)
+        lbl.setProperty("role", "title")
+        return lbl
 
-    def _separator(self, parent):
-        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=8)
+    def _hint_label(self, text=""):
+        lbl = QLabel(text)
+        lbl.setProperty("role", "hint")
+        lbl.setWordWrap(True)
+        return lbl
 
-    def _build_hardware_box(self, parent):
-        box = self._labelframe(parent)
-        row = ttk.Frame(box, style="Panel.TFrame")
-        row.pack(fill="x")
-        self.sys_label = ttk.Label(row, style="Panel.TLabel", wraplength=420, justify="left")
-        self.sys_label.pack(side="left", fill="x", expand=True)
-        self.suggest_btn = ttk.Button(row, command=self._auto_suggest)
-        self.suggest_btn.pack(side="right")
+    def _separator(self):
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        #line.setStyleSheet(f"color: {self.palette_colors['panel_border']};")
+        return line
+
+    def _build_hardware_box(self):
+        box = QGroupBox()
+        layout = QHBoxLayout(box)
+        self.sys_label = QLabel()
+        self.sys_label.setWordWrap(True)
+        layout.addWidget(self.sys_label, 1)
+        self.suggest_btn = QPushButton()
+        self.suggest_btn.clicked.connect(self._auto_suggest)
+        layout.addWidget(self.suggest_btn)
         return box
 
-    def _build_model_box(self, parent):
-        box = self._labelframe(parent)
+    def _build_model_box(self):
+        box = QGroupBox()
+        layout = QVBoxLayout(box)
 
-        dev_row = ttk.Frame(box, style="Panel.TFrame")
-        dev_row.pack(fill="x")
-        self.device_label = ttk.Label(dev_row, style="Panel.TLabel")
-        self.device_label.pack(side="left")
-        self.device_combo = ttk.Combobox(dev_row, state="readonly", width=14)
-        self.device_combo.pack(side="left", padx=(8, 20))
-        self.device_combo.bind("<<ComboboxSelected>>", self._on_device_combo_selected)
+        dev_row = QHBoxLayout()
+        self.device_label = QLabel()
+        self.device_label.setStyleSheet("font-weight: bold;")
+        dev_row.addWidget(self.device_label)
+        self.device_combo = QComboBox()
+        self.device_combo.setFixedWidth(140)
+        self.device_combo.currentIndexChanged.connect(self._on_device_combo_selected)
+        dev_row.addWidget(self.device_combo)
+        dev_row.addSpacing(20)
+        self.cpu_threads_label = QLabel()
+        dev_row.addWidget(self.cpu_threads_label)
+        self.cpu_threads_spin = QSpinBox()
+        self.cpu_threads_spin.setRange(1, 64)
+        self.cpu_threads_spin.setValue(4)
+        self.cpu_threads_spin.setFixedWidth(60)
+        dev_row.addWidget(self.cpu_threads_spin)
+        dev_row.addStretch(1)
+        layout.addLayout(dev_row)
 
-        self.cpu_threads_label = ttk.Label(dev_row, style="Panel.TLabel")
-        self.cpu_threads_label.pack(side="left")
-        self.cpu_threads_spin = ttk.Spinbox(dev_row, from_=1, to=64, width=5,
-                                             textvariable=self.cpu_threads_var)
-        self.cpu_threads_spin.pack(side="left", padx=(8, 0))
+        layout.addWidget(self._separator())
 
-        self._separator(box)
+        self.ability_title_label = self._title_label()
+        self.ability_title_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(self.ability_title_label)
+        self.ability_slider = QSlider(Qt.Horizontal)
+        self.ability_slider.setRange(0, len(MODEL_TABLE) - 1)
+        self.ability_slider.setValue(4)
+        self.ability_slider.valueChanged.connect(self._on_ability_changed)
+        layout.addWidget(self.ability_slider)
+        self.ability_label = QLabel()
+        self.ability_label.setWordWrap(True)
+        layout.addWidget(self.ability_label)
 
-        self.ability_title_label = ttk.Label(box, style="Title.TLabel")
-        self.ability_title_label.pack(anchor="w")
-        self.ability_scale = ttk.Scale(box, from_=0, to=len(MODEL_TABLE) - 1, orient="horizontal",
-                                        variable=self.ability_var, command=self._on_ability_scaled)
-        self.ability_scale.pack(fill="x", pady=(6, 4))
-        self.ability_label = ttk.Label(box, style="Panel.TLabel", wraplength=440, justify="left")
-        self.ability_label.pack(anchor="w", fill="x")
+        layout.addWidget(self._separator())
 
-        self._separator(box)
+        self.precision_title_label = self._title_label()
+        self.precision_title_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(self.precision_title_label)
+        self.precision_slider = QSlider(Qt.Horizontal)
+        self.precision_slider.setRange(0, len(COMPUTE_TYPES_GPU) - 1)
+        self.precision_slider.setValue(2)
+        self.precision_slider.valueChanged.connect(self._on_precision_changed)
+        layout.addWidget(self.precision_slider)
+        self.precision_label = QLabel()
+        self.precision_label.setWordWrap(True)
+        layout.addWidget(self.precision_label)
 
-        self.precision_title_label = ttk.Label(box, style="Title.TLabel")
-        self.precision_title_label.pack(anchor="w")
-        self.precision_scale = ttk.Scale(box, from_=0, to=len(COMPUTE_TYPES_GPU) - 1, orient="horizontal",
-                                          variable=self.precision_var, command=self._on_precision_scaled)
-        self.precision_scale.pack(fill="x", pady=(6, 4))
-        self.precision_label = ttk.Label(box, style="Panel.TLabel", wraplength=440, justify="left")
-        self.precision_label.pack(anchor="w", fill="x")
-
-        self.estimate_label = ttk.Label(box, style="Estimate.TLabel", wraplength=440, justify="left")
-        self.estimate_label.pack(anchor="w", fill="x", pady=(10, 0))
-
-        return box
-
-    def _build_source_box(self, parent):
-        box = self._labelframe(parent)
-
-        self.radio_file = ttk.Radiobutton(box, variable=self.source_var, value="file",
-                                           command=self._on_source_toggled)
-        self.radio_file.pack(anchor="w")
-
-        file_row = ttk.Frame(box, style="Panel.TFrame")
-        file_row.pack(fill="x", pady=(4, 0))
-        self.file_path_entry = ttk.Entry(file_row, textvariable=self.file_path_var)
-        self.file_path_entry.pack(side="left", fill="x", expand=True)
-        self.file_browse_btn = ttk.Button(file_row, command=self._browse_file)
-        self.file_browse_btn.pack(side="left", padx=(8, 0))
-
-        self._separator(box)
-
-        self.radio_url = ttk.Radiobutton(box, variable=self.source_var, value="url",
-                                          command=self._on_source_toggled)
-        self.radio_url.pack(anchor="w")
-        self.url_entry = ttk.Entry(box, textvariable=self.url_var, state="disabled")
-        self.url_entry.pack(fill="x", pady=(4, 0))
-
-        self._separator(box)
-
-        out_row = ttk.Frame(box, style="Panel.TFrame")
-        out_row.pack(fill="x")
-        self.output_folder_label = ttk.Label(out_row, style="Panel.TLabel")
-        self.output_folder_label.pack(side="left")
-        self.out_dir_entry = ttk.Entry(box, textvariable=self.out_dir_var)
-        self.out_dir_entry.pack(fill="x", pady=(4, 0), side="bottom")
-        self.out_browse_btn = ttk.Button(out_row, command=self._browse_out_dir)
-        self.out_browse_btn.pack(side="right")
+        self.estimate_label = QLabel()
+        self.estimate_label.setWordWrap(True)
+        #self.estimate_label.setFont(self.fonts["bold"])
+        layout.addWidget(self.estimate_label)
 
         return box
 
-    def _build_options_box(self, parent):
-        box = self._labelframe(parent)
+    def _build_source_box(self):
+        box = QGroupBox()
+        layout = QVBoxLayout(box)
 
-        lang_row = ttk.Frame(box, style="Panel.TFrame")
-        lang_row.pack(fill="x")
-        self.language_label = ttk.Label(lang_row, style="Panel.TLabel")
-        self.language_label.pack(side="left")
-        self.lang_combo = ttk.Combobox(lang_row, state="readonly", width=26,
-                                        textvariable=self.lang_display_var)
-        self.lang_combo.pack(side="left", padx=(8, 0))
-        self.lang_combo.bind("<<ComboboxSelected>>", self._on_lang_combo_selected)
+        self.radio_file = QRadioButton()
+        self.radio_file.setChecked(True)
+        self.radio_file.toggled.connect(self._on_source_toggled)
+        layout.addWidget(self.radio_file)
 
-        self._separator(box)
+        file_row = QHBoxLayout()
+        self.file_path_edit = QLineEdit()
+        file_row.addWidget(self.file_path_edit, 1)
+        self.file_browse_btn = QPushButton()
+        self.file_browse_btn.clicked.connect(self._browse_file)
+        file_row.addWidget(self.file_browse_btn)
+        layout.addLayout(file_row)
 
-        self.steering_title_label = ttk.Label(box, style="Title.TLabel")
-        self.steering_title_label.pack(anchor="w")
+        layout.addWidget(self._separator())
+
+        self.radio_url = QRadioButton()
+        layout.addWidget(self.radio_url)
+        self.url_edit = QLineEdit()
+        self.url_edit.setEnabled(False)
+        layout.addWidget(self.url_edit)
+
+        layout.addWidget(self._separator())
+
+        out_row = QHBoxLayout()
+        self.output_folder_label = QLabel()
+        self.output_folder_label.setStyleSheet("font-weight: bold;")
+        out_row.addWidget(self.output_folder_label)
+        out_row.addStretch(1)
+        self.out_browse_btn = QPushButton()
+        self.out_browse_btn.clicked.connect(self._browse_out_dir)
+        out_row.addWidget(self.out_browse_btn)
+        layout.addLayout(out_row)
+        self.out_dir_edit = QLineEdit(os.path.join(os.path.expanduser("~"), "whisper_output"))
+        layout.addWidget(self.out_dir_edit)
+
+        return box
+
+    def _build_options_box(self):
+        box = QGroupBox()
+        layout = QVBoxLayout(box)
+
+        lang_row = QHBoxLayout()
+        self.language_label = QLabel()
+        self.language_label.setStyleSheet("font-weight: bold;")
+        lang_row.addWidget(self.language_label)
+        self.lang_combo = QComboBox()
+        self.lang_combo.setMinimumWidth(220)
+        lang_row.addWidget(self.lang_combo)
+        lang_row.addStretch(1)
+        layout.addLayout(lang_row)
+
+        layout.addWidget(self._separator())
+
+        self.steering_title_label = self._title_label()
+        layout.addWidget(self.steering_title_label)
 
         # initial_prompt, driven by a named "style" instead of raw example
         # text -- selecting a style resolves to a fitting example prompt
         # behind the scenes. A "Custom" style keeps the raw-text route open.
-        self.initial_prompt_label = ttk.Label(box, style="Panel.TLabel")
-        self.initial_prompt_label.pack(anchor="w", pady=(8, 0))
-        self.style_combo = ttk.Combobox(box, state="readonly", textvariable=self.style_display_var)
-        self.style_combo.pack(fill="x", pady=(2, 0))
-        self.style_combo.bind("<<ComboboxSelected>>", self._on_style_combo_selected)
-        self.initial_prompt_hint_label = ttk.Label(box, style="Hint.TLabel", wraplength=440, justify="left")
-        self.initial_prompt_hint_label.pack(anchor="w", fill="x", pady=(2, 0))
+        self.initial_prompt_label = QLabel()
+        self.initial_prompt_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(self.initial_prompt_label)
+        self.style_combo = QComboBox()
+        self.style_combo.currentIndexChanged.connect(self._on_style_combo_selected)
+        layout.addWidget(self.style_combo)
+        self.initial_prompt_hint_label = self._hint_label()
+        layout.addWidget(self.initial_prompt_hint_label)
 
-        self.initial_prompt_custom_label = ttk.Label(box, style="Panel.TLabel")
-        self.initial_prompt_custom_entry = ttk.Entry(box, textvariable=self.initial_prompt_custom_var)
-        # custom label/entry are packed on demand by _sync_custom_style_visibility()
+        self.initial_prompt_custom_label = QLabel()
+        layout.addWidget(self.initial_prompt_custom_label)
+        self.initial_prompt_custom_edit = QLineEdit()
+        layout.addWidget(self.initial_prompt_custom_edit)
 
         # prefix -- forced verbatim start
-        self.prefix_label = ttk.Label(box, style="Panel.TLabel")
-        self.prefix_label.pack(anchor="w", pady=(10, 0))
-        self.prefix_entry = ttk.Entry(box, textvariable=self.prefix_var)
-        self.prefix_entry.pack(fill="x", pady=(2, 0))
-        self.prefix_hint_label = ttk.Label(box, style="Hint.TLabel", wraplength=440, justify="left")
-        self.prefix_hint_label.pack(anchor="w", fill="x", pady=(2, 0))
+        self.prefix_label = QLabel()
+        self.prefix_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(self.prefix_label)
+        self.prefix_edit = QLineEdit()
+        layout.addWidget(self.prefix_edit)
+        self.prefix_hint_label = self._hint_label()
+        layout.addWidget(self.prefix_hint_label)
 
         # hotwords -- decoding boost, no context cost
-        self.hotwords_label = ttk.Label(box, style="Panel.TLabel")
-        self.hotwords_label.pack(anchor="w", pady=(10, 0))
-        self.hotwords_entry = ttk.Entry(box, textvariable=self.hotwords_var)
-        self.hotwords_entry.pack(fill="x", pady=(2, 0))
-        self.hotwords_hint_label = ttk.Label(box, style="Hint.TLabel", wraplength=440, justify="left")
-        self.hotwords_hint_label.pack(anchor="w", fill="x", pady=(2, 0))
+        self.hotwords_label = QLabel()
+        self.hotwords_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(self.hotwords_label)
+        self.hotwords_edit = QLineEdit()
+        layout.addWidget(self.hotwords_edit)
+        self.hotwords_hint_label = self._hint_label()
+        layout.addWidget(self.hotwords_hint_label)
 
-        self._separator(box)
+        layout.addWidget(self._separator())
 
-        opts_row = ttk.Frame(box, style="Panel.TFrame")
-        opts_row.pack(fill="x")
-        self.vad_checkbox = ttk.Checkbutton(opts_row, variable=self.vad_var)
-        self.vad_checkbox.pack(side="left")
-        self.vad_info_btn = InfoDot(opts_row, lambda: self.t("vad_tooltip"), self.palette)
-        self.vad_info_btn.pack(side="left", padx=(6, 24))
-        self.beam_label = ttk.Label(opts_row, style="Panel.TLabel")
-        self.beam_label.pack(side="left")
-        self.beam_spin = ttk.Spinbox(opts_row, from_=1, to=10, width=5, textvariable=self.beam_var)
-        self.beam_spin.pack(side="left", padx=(8, 0))
+        opts_row = QHBoxLayout()
+        self.vad_checkbox = QCheckBox()
+        self.vad_checkbox.setStyleSheet("font-weight: bold;")
+        self.vad_checkbox.setChecked(True)
+        opts_row.addWidget(self.vad_checkbox)
+        self.vad_info_btn = InfoDot(lambda: self.t("vad_tooltip"))
+        opts_row.addWidget(self.vad_info_btn)
+        opts_row.addSpacing(18)
+        self.beam_label = QLabel()
+        opts_row.addWidget(self.beam_label)
+        self.beam_spin = QSpinBox()
+        self.beam_spin.setRange(1, 10)
+        self.beam_spin.setValue(5)
+        self.beam_spin.setFixedWidth(60)
+        opts_row.addWidget(self.beam_spin)
+        opts_row.addStretch(1)
+        layout.addLayout(opts_row)
 
-        self._separator(box)
+        layout.addWidget(self._separator())
 
-        fmt_row = ttk.Frame(box, style="Panel.TFrame")
-        fmt_row.pack(fill="x")
-        self.formats_label = ttk.Label(fmt_row, style="Panel.TLabel")
-        self.formats_label.pack(side="left")
-        ttk.Checkbutton(fmt_row, text=".txt", variable=self.fmt_txt_var).pack(side="left", padx=(10, 0))
-        ttk.Checkbutton(fmt_row, text=".srt", variable=self.fmt_srt_var).pack(side="left", padx=(10, 0))
-        ttk.Checkbutton(fmt_row, text=".vtt", variable=self.fmt_vtt_var).pack(side="left", padx=(10, 0))
+        fmt_row = QHBoxLayout()
+        self.formats_label = QLabel()
+        self.formats_label.setStyleSheet("font-weight: bold;")
+        fmt_row.addWidget(self.formats_label)
+        self.fmt_txt_check = QCheckBox(".txt")
+        self.fmt_txt_check.setChecked(True)
+        fmt_row.addWidget(self.fmt_txt_check)
+        self.fmt_srt_check = QCheckBox(".srt")
+        self.fmt_srt_check.setChecked(True)
+        fmt_row.addWidget(self.fmt_srt_check)
+        self.fmt_vtt_check = QCheckBox(".vtt")
+        fmt_row.addWidget(self.fmt_vtt_check)
+        fmt_row.addStretch(1)
+        layout.addLayout(fmt_row)
 
+        layout.addStretch(1)
+        self._sync_custom_style_visibility()
         return box
 
-    def _build_run_box(self, parent):
-        box = self._labelframe(parent)
+    def _build_run_box(self):
+        box = QGroupBox()
+        layout = QVBoxLayout(box)
 
-        btn_row = ttk.Frame(box, style="Panel.TFrame")
-        btn_row.pack(fill="x")
-        self.start_btn = ttk.Button(btn_row, style="Accent.TButton", command=self._start)
-        self.start_btn.pack(side="left", fill="x", expand=True)
-        self.stop_btn = ttk.Button(btn_row, style="Danger.TButton", command=self._stop, state="disabled")
-        self.stop_btn.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        btn_row = QHBoxLayout()
+        self.start_btn = QPushButton()
+        self.start_btn.setObjectName("accentButton")
+        self.start_btn.clicked.connect(self._start)
+        btn_row.addWidget(self.start_btn, 1)
+        self.stop_btn = QPushButton()
+        self.stop_btn.setObjectName("dangerButton")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self._stop)
+        btn_row.addWidget(self.stop_btn, 1)
+        layout.addLayout(btn_row)
 
-        self.progress = ttk.Progressbar(box, mode="indeterminate")
-        # kept hidden until a job starts; packed on demand
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 1)
+        self.progress.setTextVisible(False)
+        self.progress.setVisible(False)
+        layout.addWidget(self.progress)
 
-        self.log_box = scrolledtext.ScrolledText(
-            box, height=12, wrap="word", background=self.palette["log_bg"],
-            foreground=self.palette["log_fg"], insertbackground=self.palette["text"],
-            font=FONT_MONO, relief="flat", borderwidth=0,
-        )
-        self.log_box.configure(state="disabled")
-        self.log_box.pack(fill="both", expand=True, pady=(10, 0))
+        self.log_box = QPlainTextEdit()
+        self.log_box.setReadOnly(True)
+        #self.log_box.setFont(self.fonts["mono"])
+        layout.addWidget(self.log_box, 1)
 
         return box
 
     # ---------------------------- TRANSLATION ----------------------------
 
     def retranslate_ui(self):
-        self.title(self.t("window_title"))
-        self.header_label.configure(text=self.t("app_header"))
-        self.ui_lang_label.configure(text=self.t("ui_lang_label"))
+        self.setWindowTitle(self.t("window_title"))
+        self.header_label.setText(self.t("app_header"))
+        self.ui_lang_label.setText(self.t("ui_lang_label"))
 
-        self.hardware_box.configure(text=self.t("group_hardware"))
+        self.hardware_box.setTitle(self.t("group_hardware"))
         gpu_txt = (
             self.t("gpu_detected", name=self.gpu_name, vram=self.vram_gb)
             if self.has_cuda else self.t("gpu_none")
         )
-        self.sys_label.configure(text=f"{gpu_txt}    |    {self.t('system_ram', ram=self.ram_gb)}")
-        self.suggest_btn.configure(text=self.t("suggest_btn"))
+        self.sys_label.setText(f"{gpu_txt}\n{self.t('system_ram', ram=self.ram_gb)}")
+        self.suggest_btn.setText(self.t("suggest_btn"))
 
-        self.model_box.configure(text=self.t("group_model"))
-        self.device_label.configure(text=self.t("device_label"))
-        self.device_combo.configure(values=[self.t("device_gpu"), self.t("device_cpu")])
-        self._sync_device_combo_display()
-        self.cpu_threads_label.configure(text=self.t("cpu_threads_label"))
-        self.ability_title_label.configure(text=self.t("ability_title"))
-        self.precision_title_label.configure(text=self.t("precision_title"))
+        self.model_box.setTitle(self.t("group_model"))
+        self.device_label.setText(self.t("device_label"))
+        self._rebuild_device_combo()
+        self.cpu_threads_label.setText(self.t("cpu_threads_label"))
+        self.ability_title_label.setText(self.t("ability_title"))
+        self.precision_title_label.setText(self.t("precision_title"))
 
-        self.source_box.configure(text=self.t("group_source"))
-        self.radio_file.configure(text=self.t("radio_file"))
-        self.radio_url.configure(text=self.t("radio_url"))
-        self.file_browse_btn.configure(text=self.t("browse"))
-        self.out_browse_btn.configure(text=self.t("browse"))
-        self.output_folder_label.configure(text=self.t("output_folder_label"))
-        self._set_placeholder(self.file_path_entry, self.file_path_var, self.t("file_placeholder"))
-        self._set_placeholder(self.url_entry, self.url_var, self.t("url_placeholder"))
+        self.source_box.setTitle(self.t("group_source"))
+        self.radio_file.setText(self.t("radio_file"))
+        self.radio_url.setText(self.t("radio_url"))
+        self.file_browse_btn.setText(self.t("browse"))
+        self.out_browse_btn.setText(self.t("browse"))
+        self.output_folder_label.setText(self.t("output_folder_label"))
+        self.file_path_edit.setPlaceholderText(self.t("file_placeholder"))
+        self.url_edit.setPlaceholderText(self.t("url_placeholder"))
 
-        self.options_box.configure(text=self.t("group_options"))
-        self.language_label.configure(text=self.t("language_label"))
+        self.options_box.setTitle(self.t("group_options"))
+        self.language_label.setText(self.t("language_label"))
         self._rebuild_language_combo()
 
-        self.steering_title_label.configure(text=self.t("steering_title"))
-        self.initial_prompt_label.configure(text=self.t("initial_prompt_label"))
-        self.initial_prompt_hint_label.configure(text=self.t("initial_prompt_hint"))
-        self.initial_prompt_custom_label.configure(text=self.t("initial_prompt_custom_label"))
+        self.steering_title_label.setText(self.t("steering_title"))
+        self.initial_prompt_label.setText(self.t("initial_prompt_label"))
+        self.initial_prompt_hint_label.setText(self.t("initial_prompt_hint"))
+        self.initial_prompt_custom_label.setText(self.t("initial_prompt_custom_label"))
         self._rebuild_style_combo()
-        self.prefix_label.configure(text=self.t("prefix_label"))
-        self.prefix_hint_label.configure(text=self.t("prefix_hint"))
-        self.hotwords_label.configure(text=self.t("hotwords_label"))
-        self.hotwords_hint_label.configure(text=self.t("hotwords_hint"))
+        self.prefix_label.setText(self.t("prefix_label"))
+        self.prefix_hint_label.setText(self.t("prefix_hint"))
+        self.hotwords_label.setText(self.t("hotwords_label"))
+        self.hotwords_hint_label.setText(self.t("hotwords_hint"))
 
-        self.vad_checkbox.configure(text=self.t("vad_checkbox"))
-        self.beam_label.configure(text=self.t("beam_label"))
-        self.formats_label.configure(text=self.t("formats_label"))
+        self.vad_checkbox.setText(self.t("vad_checkbox"))
+        self.vad_info_btn.refresh_tooltip()
+        self.beam_label.setText(self.t("beam_label"))
+        self.formats_label.setText(self.t("formats_label"))
 
-        self.run_box.configure(text=self.t("group_run"))
-        self.start_btn.configure(text=self.t("start_btn"))
-        self.stop_btn.configure(text=self.t("stop_btn"))
+        self.run_box.setTitle(self.t("group_run"))
+        self.start_btn.setText(self.t("start_btn"))
+        self.stop_btn.setText(self.t("stop_btn"))
 
         self._refresh_model_label()
         self._refresh_precision_label()
         self._update_estimate()
 
-    @staticmethod
-    def _set_placeholder(entry_widget, var, text):
-        # ttk.Entry has no native placeholder; store it as a tooltip-esque
-        # hint via a light style instead, keeping actual content untouched.
-        pass  # placeholders intentionally omitted to avoid clobbering user input
-
-    def _on_ui_lang_changed(self, _event=None):
-        self.lang = "it" if self.ui_lang_combo.get() == "Italiano" else "en"
+    def _on_ui_lang_changed(self, text):
+        self.lang = "it" if text == "Italiano" else "en"
         self.retranslate_ui()
+
+    # ---------------------------- DEVICE COMBO ----------------------------
+
+    def _rebuild_device_combo(self):
+        current_data = self.device_combo.currentData()
+        self.device_combo.blockSignals(True)
+        self.device_combo.clear()
+        self.device_combo.addItem(self.t("device_gpu"), "cuda")
+        self.device_combo.addItem(self.t("device_cpu"), "cpu")
+        target = current_data or ("cuda" if self.has_cuda else "cpu")
+        idx = self.device_combo.findData(target)
+        self.device_combo.setCurrentIndex(idx if idx >= 0 else 1)
+        self.device_combo.blockSignals(False)
 
     # ---------------------------- LANGUAGE COMBO ----------------------------
 
     def _rebuild_language_combo(self):
-        current_code = self._lang_code_by_display.get(self.lang_display_var.get(), "auto")
-        self._lang_code_by_display.clear()
-        self._display_by_lang_code.clear()
-        displays = []
+        current_code = self.lang_combo.currentData() or "auto"
+        self.lang_combo.blockSignals(True)
+        self.lang_combo.clear()
         for code, name_en, name_it in LANGUAGES:
             name = name_it if self.lang == "it" else name_en
             display = name if code == "auto" else f"{name} ({code})"
-            displays.append(display)
-            self._lang_code_by_display[display] = code
-            self._display_by_lang_code[code] = display
-        self.lang_combo.configure(values=displays)
-        target_display = self._display_by_lang_code.get(current_code, displays[0])
-        self.lang_display_var.set(target_display)
-
-    def _on_lang_combo_selected(self, _event=None):
-        pass  # value already bound via textvariable
+            self.lang_combo.addItem(display, code)
+        idx = self.lang_combo.findData(current_code)
+        self.lang_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.lang_combo.blockSignals(False)
 
     def _current_language_code(self):
-        return self._lang_code_by_display.get(self.lang_display_var.get(), "auto")
+        return self.lang_combo.currentData() or "auto"
 
     # ---------------------------- STYLE COMBO ----------------------------
 
     def _rebuild_style_combo(self):
-        current_key = self._style_key_by_display.get(self.style_display_var.get(), "none")
-        self._style_key_by_display.clear()
-        self._display_by_style_key.clear()
-        displays = []
+        current_key = self.style_combo.currentData() or "none"
+        self.style_combo.blockSignals(True)
+        self.style_combo.clear()
         for preset in STYLE_PRESETS:
             label = preset["label_it"] if self.lang == "it" else preset["label_en"]
-            displays.append(label)
-            self._style_key_by_display[label] = preset["key"]
-            self._display_by_style_key[preset["key"]] = label
-        self.style_combo.configure(values=displays)
-        target_display = self._display_by_style_key.get(current_key, displays[0])
-        self.style_display_var.set(target_display)
+            self.style_combo.addItem(label, preset["key"])
+        idx = self.style_combo.findData(current_key)
+        self.style_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.style_combo.blockSignals(False)
         self._sync_custom_style_visibility()
 
-    def _on_style_combo_selected(self, _event=None):
+    def _on_style_combo_selected(self, _index):
         self._sync_custom_style_visibility()
 
     def _current_style_key(self):
-        return self._style_key_by_display.get(self.style_display_var.get(), "none")
+        return self.style_combo.currentData() or "none"
 
     def _sync_custom_style_visibility(self):
-        if self._current_style_key() == "custom":
-            self.initial_prompt_custom_label.pack(anchor="w", pady=(8, 0))
-            self.initial_prompt_custom_entry.pack(fill="x", pady=(2, 0), before=self.prefix_label)
-        else:
-            self.initial_prompt_custom_label.pack_forget()
-            self.initial_prompt_custom_entry.pack_forget()
+        is_custom = self._current_style_key() == "custom"
+        self.initial_prompt_custom_label.setVisible(is_custom)
+        self.initial_prompt_custom_edit.setVisible(is_custom)
 
     def _effective_initial_prompt(self):
         key = self._current_style_key()
         if key == "custom":
-            return self.initial_prompt_custom_var.get()
+            return self.initial_prompt_custom_edit.text()
         preset = next((p for p in STYLE_PRESETS if p["key"] == key), None)
         return preset["prompt"] if preset else ""
 
@@ -1441,79 +1266,68 @@ class WhisperGUI(tk.Tk):
 
     def _log(self, text: str):
         ts = datetime.now().strftime("%H:%M:%S")
-        self.log_box.configure(state="normal")
-        self.log_box.insert("end", f"[{ts}] {text}\n")
-        self.log_box.see("end")
-        self.log_box.configure(state="disabled")
+        self.log_box.appendPlainText(f"[{ts}] {text}")
 
     def _current_device(self):
-        return self.device_var.get()
-
-    def _sync_device_combo_display(self):
-        display = self.t("device_gpu") if self.device_var.get() == "cuda" else self.t("device_cpu")
-        self.device_combo.set(display)
+        return self.device_combo.currentData() or "cpu"
 
     def _current_compute_types(self):
         return COMPUTE_TYPES_GPU if self._current_device() == "cuda" else COMPUTE_TYPES_CPU
 
     def _refresh_precision_combo_targets(self):
         types = self._current_compute_types()
-        self.precision_scale.configure(to=len(types) - 1)
+        self.precision_slider.blockSignals(True)
+        self.precision_slider.setRange(0, len(types) - 1)
         default_idx = min(2, len(types) - 1)
-        self.precision_var.set(default_idx)
+        self.precision_slider.setValue(default_idx)
+        self.precision_slider.blockSignals(False)
         self._refresh_precision_label()
 
-    def _on_device_combo_selected(self, _event=None):
-        chosen_gpu = self.device_combo.get() == self.t("device_gpu")
+    def _on_device_combo_selected(self, _index):
+        chosen_gpu = self.device_combo.currentData() == "cuda"
         if chosen_gpu and not self.has_cuda:
-            messagebox.showwarning(self.t("no_gpu_title"), self.t("no_gpu_msg"))
-            self.device_var.set("cpu")
-            self._sync_device_combo_display()
-            return
-        self.device_var.set("cuda" if chosen_gpu else "cpu")
+            QMessageBox.warning(self, self.t("no_gpu_title"), self.t("no_gpu_msg"))
+            idx = self.device_combo.findData("cpu")
+            self.device_combo.blockSignals(True)
+            self.device_combo.setCurrentIndex(idx)
+            self.device_combo.blockSignals(False)
         self._on_device_changed()
 
     def _on_device_changed(self):
         is_cpu = self._current_device() == "cpu"
-        self.cpu_threads_spin.configure(state="normal" if is_cpu else "disabled")
+        self.cpu_threads_spin.setEnabled(is_cpu)
         self._refresh_precision_combo_targets()
         self._update_estimate()
 
-    def _on_ability_scaled(self, raw_value):
-        val = int(round(float(raw_value)))
-        if self.ability_var.get() != val:
-            self.ability_var.set(val)
+    def _on_ability_changed(self, _value):
         self._refresh_model_label()
         self._update_estimate()
 
-    def _on_precision_scaled(self, raw_value):
-        val = int(round(float(raw_value)))
-        if self.precision_var.get() != val:
-            self.precision_var.set(val)
+    def _on_precision_changed(self, _value):
         self._refresh_precision_label()
         self._update_estimate()
 
     def _refresh_model_label(self):
-        m = MODEL_TABLE[self.ability_var.get()]
+        m = MODEL_TABLE[self.ability_slider.value()]
         desc = m["desc_it"] if self.lang == "it" else m["desc_en"]
         params_word = "parametri" if self.lang == "it" else "parameters"
-        self.ability_label.configure(
-            text=f"{m['label']} ({m['name']}) \u2014 {m['params']} {params_word}.\n{desc}"
+        self.ability_label.setText(
+            f"{m['label']} ({m['name']}) \u2014 {m['params']} {params_word}.\n{desc}"
         )
 
     def _refresh_precision_label(self):
         types = self._current_compute_types()
-        idx = min(self.precision_var.get(), len(types) - 1)
+        idx = min(self.precision_slider.value(), len(types) - 1)
         ct = types[idx]
         label = ct["label_it"] if self.lang == "it" else ct["label_en"]
-        self.precision_label.configure(text=f"{label}  (compute_type=\"{ct['name']}\")")
+        self.precision_label.setText(f"{label}  (compute_type=\"{ct['name']}\")")
 
     def _update_estimate(self):
         if not hasattr(self, "estimate_label"):
             return
-        m = MODEL_TABLE[self.ability_var.get()]
+        m = MODEL_TABLE[self.ability_slider.value()]
         types = self._current_compute_types()
-        idx = min(self.precision_var.get(), len(types) - 1)
+        idx = min(self.precision_slider.value(), len(types) - 1)
         ct = types[idx]
         gb = estimate_memory_gb(m, ct)
 
@@ -1532,7 +1346,9 @@ class WhisperGUI(tk.Tk):
             f"{self.t('estimate_prefix', unit=unit)}: ~{gb} GB "
             f"({self.t('estimate_available')}: ~{avail} GB){warn}"
         )
-        self.estimate_label.configure(text=text, foreground=(self.palette["danger"] if warn else self.palette["success"]))
+        color = "#e0a13c" if warn else "#4fbf85"
+        self.estimate_label.setText(text)
+        self.estimate_label.setStyleSheet(f"color: {color}; font-weight: bold;")
 
     def _auto_suggest(self):
         if self.has_cuda and self.vram_gb > 0:
@@ -1557,61 +1373,56 @@ class WhisperGUI(tk.Tk):
         if best is None:
             best = (0, 0)
 
-        self.device_var.set(device_data)
-        self._sync_device_combo_display()
+        idx = self.device_combo.findData(device_data)
+        self.device_combo.blockSignals(True)
+        self.device_combo.setCurrentIndex(idx if idx >= 0 else 1)
+        self.device_combo.blockSignals(False)
         self._on_device_changed()
-        self.ability_var.set(best[0])
-        self.precision_var.set(best[1])
+
+        self.ability_slider.setValue(best[0])
+        self.precision_slider.setValue(best[1])
         self._refresh_model_label()
         self._refresh_precision_label()
         self._update_estimate()
         self._log(self.t("suggest_applied"))
 
-    def _on_source_toggled(self):
-        is_file = self.source_var.get() == "file"
-        self.file_path_entry.configure(state="normal" if is_file else "disabled")
-        self.file_browse_btn.configure(state="normal" if is_file else "disabled")
-        self.url_entry.configure(state="disabled" if is_file else "normal")
+    def _on_source_toggled(self, _checked):
+        is_file = self.radio_file.isChecked()
+        self.file_path_edit.setEnabled(is_file)
+        self.file_browse_btn.setEnabled(is_file)
+        self.url_edit.setEnabled(not is_file)
 
     def _browse_file(self):
-        path = filedialog.askopenfilename(
-            title=self.t("select_file_dialog"),
-            filetypes=[
-                ("Media files", "*.mp3 *.wav *.m4a *.flac *.ogg *.mp4 *.mkv *.mov *.avi *.webm"),
-                ("All files", "*.*"),
-            ],
-        )
+        filt = f"{self.t('media_filter')};;{self.t('all_files_filter')}"
+        path, _ = QFileDialog.getOpenFileName(self, self.t("select_file_dialog"), "", filt)
         if path:
-            self.file_path_var.set(path)
+            self.file_path_edit.setText(path)
 
     def _browse_out_dir(self):
-        path = filedialog.askdirectory(title=self.t("select_out_dialog"))
+        path = QFileDialog.getExistingDirectory(self, self.t("select_out_dialog"))
         if path:
-            self.out_dir_var.set(path)
+            self.out_dir_edit.setText(path)
 
     def _set_running(self, running: bool):
-        self.start_btn.configure(state="disabled" if running else "normal")
-        self.stop_btn.configure(state="normal" if running else "disabled")
+        self.start_btn.setEnabled(not running)
+        self.stop_btn.setEnabled(running)
+        self.progress.setVisible(running)
         if running:
-            self.progress.pack(fill="x", pady=(8, 0), before=self.log_box)
-            self.progress.start(12)
+            self.progress.setRange(0, 0)  # indeterminate/busy mode
         else:
-            self.progress.stop()
-            self.progress.pack_forget()
+            self.progress.setRange(0, 1)
 
     def _start(self):
-        out_dir = self.out_dir_var.get().strip()
+        out_dir = self.out_dir_edit.text().strip()
         if not out_dir:
-            messagebox.showwarning(self.t("missing_output_title"), self.t("missing_output_msg"))
+            QMessageBox.warning(self, self.t("missing_output_title"), self.t("missing_output_msg"))
             return
         os.makedirs(out_dir, exist_ok=True)
 
         if not ensure_ffmpeg_available():
-            messagebox.showwarning(self.t("no_ffmpeg_title"), self.t("no_ffmpeg_msg"))
+            QMessageBox.warning(self, self.t("no_ffmpeg_title"), self.t("no_ffmpeg_msg"))
 
-        self.log_box.configure(state="normal")
-        self.log_box.delete("1.0", "end")
-        self.log_box.configure(state="disabled")
+        self.log_box.clear()
 
         # Fresh cancel flag for this run -- a leftover set() from a prior
         # cancelled job would otherwise make the very next job cancel itself
@@ -1619,22 +1430,26 @@ class WhisperGUI(tk.Tk):
         self.cancel_event = threading.Event()
         self._set_running(True)
 
-        if self.source_var.get() == "url":
-            url = self.url_var.get().strip()
+        if self.radio_url.isChecked():
+            url = self.url_edit.text().strip()
             if not url:
-                messagebox.showwarning(self.t("missing_url_title"), self.t("missing_url_msg"))
+                QMessageBox.warning(self, self.t("missing_url_title"), self.t("missing_url_msg"))
                 self._set_running(False)
                 return
             download_dir = os.path.join(out_dir, "downloads")
             self._log(self.t("starting_download", url=url))
             self.active_worker = "download"
-            worker = DownloadWorker(url, download_dir, self.result_queue, self.cancel_event)
+            worker = DownloadWorker(url, download_dir, self.cancel_event)
+            worker.log.connect(self._log)
+            worker.download_done.connect(self._on_download_done)
+            worker.cancelled.connect(self._on_cancelled)
+            worker.failed.connect(self._on_worker_failed)
             self.current_worker_thread = worker
             worker.start()
         else:
-            path = self.file_path_var.get().strip()
+            path = self.file_path_edit.text().strip()
             if not path or not os.path.isfile(path):
-                messagebox.showwarning(self.t("missing_file_title"), self.t("missing_file_msg"))
+                QMessageBox.warning(self, self.t("missing_file_title"), self.t("missing_file_msg"))
                 self._set_running(False)
                 return
             self._begin_transcription(path)
@@ -1649,29 +1464,40 @@ class WhisperGUI(tk.Tk):
         if self.active_worker is None:
             return
         self.cancel_event.set()
-        self.stop_btn.configure(state="disabled")
+        self.stop_btn.setEnabled(False)
         self._log(self.t("stopping"))
+
+    def _on_download_done(self, path):
+        self.active_worker = None
+        self._log(self.t("audio_ready", path=path))
+        self._begin_transcription(path)
+
+    def _on_cancelled(self):
+        self.active_worker = None
+        self.current_worker_thread = None
+        self._set_running(False)
+        self._log(self.t("cancelled_log"))
 
     def _begin_transcription(self, audio_path: str):
         self.current_audio_path = audio_path
-        m = MODEL_TABLE[self.ability_var.get()]
+        m = MODEL_TABLE[self.ability_slider.value()]
         types = self._current_compute_types()
-        ct = types[min(self.precision_var.get(), len(types) - 1)]
+        ct = types[min(self.precision_slider.value(), len(types) - 1)]
         device = self._current_device()
         lang = self._current_language_code()
         initial_prompt = self._effective_initial_prompt()
-        prefix = self.prefix_var.get()
-        hotwords = self.hotwords_var.get()
-        vad = self.vad_var.get()
-        beam = self.beam_var.get()
-        threads = self.cpu_threads_var.get()
+        prefix = self.prefix_edit.text()
+        hotwords = self.hotwords_edit.text()
+        vad = self.vad_checkbox.isChecked()
+        beam = self.beam_spin.value()
+        threads = self.cpu_threads_spin.value()
 
         self._log(self.t("model_device_line", model=m["name"], device=device, compute=ct["name"]))
         self.active_worker = "transcribe"
         # Downloading a URL enables the Stop button before this method runs;
         # make sure it's still enabled now that we've moved into the
         # transcription phase (in case a fast download disabled it).
-        self.stop_btn.configure(state="normal")
+        self.stop_btn.setEnabled(True)
         worker = TranscribeWorker(
             audio_path=audio_path,
             model_name=m["name"],
@@ -1684,56 +1510,33 @@ class WhisperGUI(tk.Tk):
             vad_filter=vad,
             beam_size=beam,
             cpu_threads=threads,
-            result_queue=self.result_queue,
             cancel_event=self.cancel_event,
         )
+        worker.log.connect(self._log)
+        worker.transcribe_done.connect(self._on_transcribe_finished)
+        worker.cancelled.connect(self._on_cancelled)
+        worker.failed.connect(self._on_worker_failed)
         self.current_worker_thread = worker
         worker.start()
 
-    def _poll_queue(self):
-        try:
-            while True:
-                kind, payload = self.result_queue.get_nowait()
-                if kind == "log":
-                    self._log(payload)
-                elif kind == "download_done":
-                    self.active_worker = None
-                    self._log(self.t("audio_ready", path=payload))
-                    self._begin_transcription(payload)
-                elif kind == "transcribe_done":
-                    self.active_worker = None
-                    segments, meta = payload
-                    self._on_transcribe_finished(segments, meta)
-                elif kind == "cancelled":
-                    self.active_worker = None
-                    self.current_worker_thread = None
-                    self._set_running(False)
-                    self._log(self.t("cancelled_log"))
-                elif kind == "failed":
-                    self.active_worker = None
-                    self._on_worker_failed(payload)
-        except queue.Empty:
-            pass
-        finally:
-            self.after(100, self._poll_queue)
-
     def _on_transcribe_finished(self, segments, meta):
+        self.active_worker = None
         self._set_running(False)
         self.last_segments = segments
         self.last_meta = meta
 
-        out_dir = self.out_dir_var.get().strip()
+        out_dir = self.out_dir_edit.text().strip()
         base = os.path.splitext(os.path.basename(self.current_audio_path))[0]
         written = []
 
-        if self.fmt_txt_var.get():
+        if self.fmt_txt_check.isChecked():
             txt_path = os.path.join(out_dir, base + ".txt")
             with open(txt_path, "w", encoding="utf-8") as f:
                 for seg in segments:
                     f.write(seg.text.strip() + "\n")
             written.append(txt_path)
 
-        if self.fmt_srt_var.get():
+        if self.fmt_srt_check.isChecked():
             srt_path = os.path.join(out_dir, base + ".srt")
             with open(srt_path, "w", encoding="utf-8") as f:
                 for i, seg in enumerate(segments, start=1):
@@ -1742,7 +1545,7 @@ class WhisperGUI(tk.Tk):
                     f.write(seg.text.strip() + "\n\n")
             written.append(srt_path)
 
-        if self.fmt_vtt_var.get():
+        if self.fmt_vtt_check.isChecked():
             vtt_path = os.path.join(out_dir, base + ".vtt")
             with open(vtt_path, "w", encoding="utf-8") as f:
                 f.write("WEBVTT\n\n")
@@ -1755,17 +1558,23 @@ class WhisperGUI(tk.Tk):
         for p in written:
             self._log(f"  - {p}")
 
-        messagebox.showinfo(self.t("done_title"), self.t("done_msg") + "\n".join(written))
+        QMessageBox.information(self, self.t("done_title"), self.t("done_msg") + "\n".join(written))
 
     def _on_worker_failed(self, message: str):
+        self.active_worker = None
         self._set_running(False)
         self._log("ERROR: " + message)
-        messagebox.showerror(self.t("error_title"), message)
+        QMessageBox.critical(self, self.t("error_title"), message)
 
 
 def main():
-    app = WhisperGUI()
-    app.mainloop()
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")  # cross-platform, software-drawn style -- same
+                             # rationale as forcing "clam" in the Tk edition:
+                             # a fixed look independent of the native theme.
+    window = WhisperGUI()
+    window.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
